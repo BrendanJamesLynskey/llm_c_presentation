@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Training in Raw C/CUDA — Karpathy's llm.c Explained</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/reveal.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/theme/black.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/monokai.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- ==================== TITLE ==================== -->
+<section>
+    <h1 class="gradient-text">LLM Training<br>in Raw C/CUDA</h1>
+    <p class="subtitle">A walkthrough of Andrej Karpathy's<br><em>llm.c</em> — GPT-2/GPT-3 with no PyTorch, no cPython</p>
+    <div class="meta-info">
+        <span>~1,000 lines of C</span> · <span>Zero dependencies</span> · <span>Faster than PyTorch</span>
+    </div>
+    <p class="nav-hint">Use <kbd>→</kbd> to advance · <kbd>↓</kbd> for sub-sections · <kbd>Esc</kbd> for overview</p>
+</section>
+
+<!-- ==================== ROADMAP ==================== -->
+<section>
+    <h2>Roadmap</h2>
+    <div class="roadmap" id="roadmap">
+        <div class="roadmap-item active" data-step="1">
+            <div class="roadmap-icon">🎯</div>
+            <div class="roadmap-label">Motivation</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="2">
+            <div class="roadmap-icon">🧱</div>
+            <div class="roadmap-label">Tensor Layout</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="3">
+            <div class="roadmap-icon">➡️</div>
+            <div class="roadmap-label">Forward Kernels</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="4">
+            <div class="roadmap-icon">⬅️</div>
+            <div class="roadmap-label">Backprop by Hand</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="5">
+            <div class="roadmap-icon">🔁</div>
+            <div class="roadmap-label">Training Step</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="6">
+            <div class="roadmap-icon">🚀</div>
+            <div class="roadmap-label">CUDA &amp; Scaling</div>
+        </div>
+    </div>
+</section>
+
+<!-- ==================== PART 1: MOTIVATION ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 1</h2>
+    <h1 class="gradient-text">Motivation</h1>
+    <p>Why write LLM training in raw C/CUDA?</p>
+</section>
+
+<section>
+    <h3>The Pitch</h3>
+    <div class="explain-box">
+        <p><strong>llm.c</strong> trains GPT-2 / GPT-3 in <em>"simple, pure C/CUDA with no need for 245MB of PyTorch or 107MB of cPython."</em></p>
+    </div>
+    <div class="two-col">
+        <div class="col">
+            <div class="explain-box small">
+                <p><strong>No heavyweight dependencies.</strong> No PyTorch, no Python interpreter, no autograd engine — just a C compiler and (for the GPU path) CUDA.</p>
+                <p><strong>~1,000 readable lines.</strong> The CPU reference, <code>train_gpt2.c</code>, is a single file you can read end-to-end in an afternoon.</p>
+            </div>
+        </div>
+        <div class="col">
+            <div class="explain-box small">
+                <p><strong>Full control &amp; fast compile.</strong> Every byte of memory and every FLOP is explicit. No framework magic between you and the hardware.</p>
+                <p><strong>A clean reference.</strong> It shows exactly what PyTorch does under the hood — forward, backward and the optimiser, written out by hand.</p>
+            </div>
+        </div>
+    </div>
+    <div class="explain-box small">
+        <p><strong>The goal:</strong> reproduce GPT-2 (124M) from scratch, then scale the same code to multi-GPU and multi-node.</p>
+    </div>
+</section>
+
+<section>
+    <h3>Build &amp; Run — the Whole Toolchain</h3>
+    <pre><code class="language-bash"># CPU reference (single C file, OpenMP-parallelised)
+make train_gpt2
+OMP_NUM_THREADS=8 ./train_gpt2
+
+# GPU, fp32 reference
+make train_gpt2fp32cu
+./train_gpt2fp32cu
+
+# GPU, mixed precision (BF16) — the fast path
+make train_gpt2cu
+./train_gpt2cu</code></pre>
+    <div class="explain-box">
+        <p><strong>That's it.</strong> No <code>pip install</code>, no <code>requirements.txt</code>, no virtual environment. A <code>download_starter_pack.sh</code> script fetches the tokenizer, pretrained GPT-2 weights and the tokenised dataset shards, and you are training.</p>
+    </div>
+</section>
+
+<section>
+    <h3>What You Are About to See</h3>
+    <div class="summary-grid">
+        <div class="summary-card">
+            <h4>One big buffer</h4>
+            <ul>
+                <li>All weights in a single malloc</li>
+                <li>Struct of pointers into it</li>
+                <li>Grads mirror params exactly</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>Hand-written kernels</h4>
+            <ul>
+                <li>encoder / layernorm / matmul</li>
+                <li>attention / gelu / residual</li>
+                <li>softmax + cross-entropy</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>Manual backprop</h4>
+            <ul>
+                <li>Every <code>*_forward</code> has a <code>*_backward</code></li>
+                <li>Gradients accumulated by hand</li>
+                <li>No autograd tape</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>Hand-rolled AdamW</h4>
+            <ul>
+                <li>m and v moment buffers</li>
+                <li>Bias correction + weight decay</li>
+                <li>Then ported to CUDA</li>
+            </ul>
+        </div>
+    </div>
+</section>
+</section>
+
+<!-- ==================== PART 2: TENSOR LAYOUT ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 2</h2>
+    <h1 class="gradient-text">Layout &amp; Parameter Tensors</h1>
+    <p>One malloc, a struct of pointers, and a config</p>
+</section>
+
+<section>
+    <h3>GPT2Config — Six Integers</h3>
+    <pre><code class="language-c">typedef struct {
+    int max_seq_len;       // e.g. 1024
+    int vocab_size;        // 50257
+    int padded_vocab_size; // 50304 (padded to a nice multiple)
+    int num_layers;        // 12 for GPT-2 124M
+    int num_heads;         // 12
+    int channels;          // 768 (the embedding dim, "C")
+} GPT2Config;</code></pre>
+    <div class="explain-box">
+        <p>The entire architecture is six integers. Everything else — tensor sizes, loop bounds, offsets — is <em>derived</em> from these. Note <code>padded_vocab_size</code>: the vocab is padded (50257 → 50304) so matmuls hit aligned, GPU-friendly sizes.</p>
+    </div>
+</section>
+
+<section>
+    <h3>ParameterTensors — 16 Named Weights</h3>
+    <pre><code class="language-c">#define NUM_PARAMETER_TENSORS 16
+typedef struct {
+    float* wte;      float* wpe;      // token + position embeddings
+    float* ln1w;     float* ln1b;     // layernorm 1 (weight, bias)
+    float* qkvw;     float* qkvb;     // fused Q,K,V projection
+    float* attprojw; float* attprojb; // attention output projection
+    float* ln2w;     float* ln2b;     // layernorm 2
+    float* fcw;      float* fcb;      // MLP up-projection (4C)
+    float* fcprojw;  float* fcprojb;  // MLP down-projection
+    float* lnfw;     float* lnfb;     // final layernorm
+} ParameterTensors;</code></pre>
+    <div class="explain-box small">
+        <p>Sixteen <code>float*</code> fields. The per-layer tensors (<code>ln1w</code>, <code>qkvw</code>, …) are sized <code>L * …</code> so all layers live contiguously inside one tensor. <code>wte</code> doubles as the output classifier (weight tying).</p>
+    </div>
+</section>
+
+<section>
+    <h3>One Big Buffer, Pointers Into It</h3>
+    <pre><code class="language-c">float* malloc_and_point_parameters(ParameterTensors* params,
+                                   size_t* param_sizes) {
+    size_t num_parameters = 0;
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++)
+        num_parameters += param_sizes[i];
+    // a SINGLE allocation holds every weight in the model
+    float* params_memory =
+        (float*)mallocCheck(num_parameters * sizeof(float));
+    // point each named tensor at its slice of the buffer
+    float** ptrs[] = {&params->wte, &params->wpe, /* ...16... */};
+    float* iter = params_memory;
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        *(ptrs[i]) = iter;
+        iter += param_sizes[i];
+    }
+    return params_memory;
+}</code></pre>
+    <div class="explain-box small">
+        <p><strong>Why one buffer?</strong> The optimiser can sweep all weights in a single flat loop; the whole model can be saved, loaded or copied to the GPU with one memcpy; and there is exactly one thing to free. The named pointers are just typed views into that flat array.</p>
+    </div>
+</section>
+
+<section>
+    <h3>The Buffer, Visualised</h3>
+    <div class="buffer-strip" id="param-buffer">
+        <div class="buffer-seg s-wte" style="flex:8">wte<br>Vp·C</div>
+        <div class="buffer-seg s-wpe" style="flex:1.5">wpe<br>maxT·C</div>
+        <div class="buffer-seg s-ln" style="flex:1">ln1</div>
+        <div class="buffer-seg s-attn" style="flex:6">qkvw / attproj<br>L·3C·C</div>
+        <div class="buffer-seg s-ln" style="flex:1">ln2</div>
+        <div class="buffer-seg s-mlp" style="flex:8">fcw / fcproj<br>L·4C·C</div>
+        <div class="buffer-seg s-lnf" style="flex:0.6">lnf</div>
+    </div>
+    <p class="buffer-caption">A single contiguous <code>float*</code> — every weight in GPT-2 laid end to end (widths ≈ relative parameter counts).</p>
+    <div class="explain-box small">
+        <p><strong>Loading weights:</strong> a short Python script (<code>train_gpt2.py</code>) exports a PyTorch GPT-2 checkpoint to a flat <code>gpt2_124M.bin</code> — header (config) followed by the raw parameter blob in this exact order. The C code reads the header, computes the same sizes with <code>fill_in_parameter_sizes()</code>, then <code>fread</code>s the blob straight into the buffer.</p>
+    </div>
+</section>
+
+<section>
+    <h3>fill_in_parameter_sizes — Sizes from Config</h3>
+    <pre><code class="language-c">void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
+    size_t Vp = config.padded_vocab_size, C = config.channels;
+    size_t maxT = config.max_seq_len, L = config.num_layers;
+    param_sizes[0] = Vp * C;          // wte
+    param_sizes[1] = maxT * C;        // wpe
+    param_sizes[2] = L * C;           // ln1w
+    param_sizes[3] = L * C;           // ln1b
+    param_sizes[4] = L * (3 * C) * C; // qkvw  (fused Q,K,V)
+    param_sizes[5] = L * (3 * C);     // qkvb
+    // ... fcw is L * (4*C) * C, etc.
+}</code></pre>
+    <div class="explain-box small">
+        <p>Activations get the same treatment: <code>ActivationTensors</code> has <code>NUM_ACTIVATION_TENSORS 23</code> fields (<code>encoded</code>, <code>ln1</code>, <code>qkv</code>, <code>preatt</code>, <code>att</code>, <code>fch_gelu</code>, <code>logits</code>, <code>probs</code>, <code>losses</code>, …) backed by their own single buffer, sized once the batch <code>B</code> and sequence length <code>T</code> are known.</p>
+    </div>
+</section>
+</section>
+
+<!-- ==================== PART 3: FORWARD KERNELS ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 3</h2>
+    <h1 class="gradient-text">The Forward Pass Kernels</h1>
+    <p>Each layer is a plain C function over float arrays</p>
+</section>
+
+<section>
+    <h3>encoder_forward — Token + Position Embeddings</h3>
+    <pre><code class="language-c">void encoder_forward(float* out, int* inp, float* wte, float* wpe,
+                     int B, int T, int C) {
+    for (int b = 0; b < B; b++)
+        for (int t = 0; t < T; t++) {
+            float* out_bt = out + b * T * C + t * C;
+            int ix = inp[b * T + t];          // the token id
+            float* wte_ix = wte + ix * C;     // its embedding row
+            float* wpe_t  = wpe + t * C;      // the position row
+            for (int i = 0; i < C; i++)
+                out_bt[i] = wte_ix[i] + wpe_t[i];
+        }
+}</code></pre>
+    <div class="explain-box small">
+        <p>Pointer arithmetic <em>is</em> the indexing. <code>b*T*C + t*C</code> walks the flat activation buffer; a token id <code>ix</code> selects a row of <code>wte</code>; the position selects a row of <code>wpe</code>; the two are summed. That single addition is the embedding layer.</p>
+    </div>
+</section>
+
+<section>
+    <h3>layernorm_forward — Normalise Each Token</h3>
+    <pre><code class="language-c">void layernorm_forward(float* out, float* mean, float* rstd,
+                       float* inp, float* weight, float* bias,
+                       int B, int T, int C) {
+    float eps = 1e-5f;
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            float* x = inp + b * T * C + t * C;
+            float m = 0.0f;                          // 1. mean
+            for (int i = 0; i < C; i++) m += x[i];
+            m = m/C;
+            float v = 0.0f;                          // 2. variance
+            for (int i = 0; i < C; i++) {
+                float xshift = x[i] - m;
+                v += xshift * xshift;
+            }
+            v = v/C;
+            float s = 1.0f / sqrtf(v + eps);         // 3. 1/std
+            float* out_bt = out + b * T * C + t * C;
+            for (int i = 0; i < C; i++) {
+                float n = (s * (x[i] - m));          // normalise
+                out_bt[i] = n * weight[i] + bias[i]; // scale + shift
+            }
+            mean[b * T + t] = m;   // cached for the backward pass
+            rstd[b * T + t] = s;
+        }
+    }
+}</code></pre>
+    <div class="explain-box small">
+        <p><strong>Mean</strong> and <strong>rstd</strong> are written out, not thrown away — the backward pass needs them, so caching beats recomputing.</p>
+    </div>
+</section>
+
+<section>
+    <h3>matmul_forward &amp; the Linear Layers</h3>
+    <pre><code class="language-c">void matmul_forward(float* out, const float* inp,
+                    const float* weight, const float* bias,
+                    int B, int T, int C, int OC);
+// out[b,t,:] = inp[b,t,:] @ weight^T + bias
+//   (B,T,C) x (OC,C)^T  ->  (B,T,OC)</code></pre>
+    <div class="explain-box">
+        <p>Every projection — QKV, the attention output, both MLP layers, the final classifier — is one <code>matmul_forward</code> call. On CPU it is a triple loop with an <code>#pragma omp parallel for</code>; this single kernel is also where almost all the FLOPs (and on GPU, all the cuBLAS/cuBLASLt calls) live.</p>
+    </div>
+    <pre><code class="language-c">void gelu_forward(float* out, float* inp, int N) {
+    for (int i = 0; i < N; i++) {
+        float x = inp[i];
+        float cube = 0.044715f * x * x * x;
+        out[i] = 0.5f * x * (1.0f +
+                 tanhf(GELU_SCALING_FACTOR * (x + cube)));
+    }
+}
+void residual_forward(float* out, float* inp1, float* inp2, int N) {
+    for (int i = 0; i < N; i++) out[i] = inp1[i] + inp2[i];
+}</code></pre>
+</section>
+
+<section>
+    <h3>attention_forward — q·kᵀ, scale, mask, softmax, ·v</h3>
+    <pre><code class="language-c">void attention_forward(float* out, float* preatt, float* att,
+                       float* inp, int B, int T, int C, int NH) {
+    int C3 = C*3; int hs = C / NH;        // head size
+    float scale = 1.0 / sqrtf(hs);
+    #pragma omp parallel for collapse(3)
+    for (int b = 0; b < B; b++)
+     for (int t = 0; t < T; t++)
+      for (int h = 0; h < NH; h++) {
+        float* query_t   = inp + b*T*C3 + t*C3 + h*hs;
+        float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
+        float* att_bth    = att    + b*NH*T*T + h*T*T + t*T;
+        // 1. q . k^T for t2 <= t  (causal: never look ahead)
+        float maxval = -10000.0f;
+        for (int t2 = 0; t2 <= t; t2++) {
+            float* key_t2 = inp + b*T*C3 + t2*C3 + h*hs + C;
+            float val = 0.0f;
+            for (int i = 0; i < hs; i++) val += query_t[i]*key_t2[i];
+            val *= scale;
+            if (val > maxval) maxval = val;
+            preatt_bth[t2] = val;
+        }
+        // 2. softmax (subtract max for stability)
+        float expsum = 0.0f;
+        for (int t2 = 0; t2 <= t; t2++) {
+            float expv = expf(preatt_bth[t2] - maxval);
+            expsum += expv; att_bth[t2] = expv;
+        }
+        float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f/expsum;
+        for (int t2 = 0; t2 < T; t2++)
+            att_bth[t2] = (t2 <= t) ? att_bth[t2]*expsum_inv : 0.0f;
+        // 3. weighted sum of values -> output
+        float* out_bth = out + b*T*C + t*C + h*hs;
+        for (int i = 0; i < hs; i++) out_bth[i] = 0.0f;
+        for (int t2 = 0; t2 <= t; t2++) {
+            float* value_t2 = inp + b*T*C3 + t2*C3 + h*hs + C*2;
+            float a = att_bth[t2];
+            for (int i = 0; i < hs; i++) out_bth[i] += a * value_t2[i];
+        }
+      }
+}</code></pre>
+    <div class="explain-box small">
+        <p>The causal mask isn't a separate <code>-inf</code> matrix — the inner loops simply run <code>t2 &lt;= t</code>. Q, K and V share one fused <code>inp</code> buffer of stride <code>C3 = 3C</code>: keys at offset <code>+C</code>, values at <code>+2C</code>.</p>
+    </div>
+</section>
+
+<section>
+    <h3>The Head: Logits → Softmax → Cross-Entropy</h3>
+    <pre><code class="language-c">void softmax_forward(float* probs, float* logits,
+                     int B, int T, int V, int Vp) {
+    #pragma omp parallel for collapse(2)
+    for (int b = 0; b < B; b++)
+      for (int t = 0; t < T; t++) {
+        float* logits_bt = logits + b*T*Vp + t*Vp;
+        float* probs_bt  = probs  + b*T*Vp + t*Vp;
+        float maxval = -10000.0f;
+        for (int i = 0; i < V; i++)
+            if (logits_bt[i] > maxval) maxval = logits_bt[i];
+        float sum = 0.0f;
+        for (int i = 0; i < V; i++) {
+            probs_bt[i] = expf(logits_bt[i] - maxval); sum += probs_bt[i];
+        }
+        for (int i = 0; i < V;  i++) probs_bt[i] /= sum;
+        for (int i = V; i < Vp; i++) probs_bt[i] = 0.0f; // padded vocab
+    }
+}
+void crossentropy_forward(float* losses, float* probs, int* targets,
+                          int B, int T, int Vp) {
+    for (int b = 0; b < B; b++)
+      for (int t = 0; t < T; t++) {
+        float* probs_bt = probs + b*T*Vp + t*Vp;
+        int ix = targets[b*T + t];
+        losses[b*T + t] = -logf(probs_bt[ix]); // negative log-likelihood
+    }
+}</code></pre>
+    <div class="explain-box small">
+        <p>The padded vocab entries (<code>V..Vp</code>) are explicitly zeroed so they can never receive probability mass. The loss is the mean of <code>-log(probs[target])</code> over all B·T positions.</p>
+    </div>
+</section>
+</section>
+
+<!-- ==================== PART 4: BACKPROP ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 4</h2>
+    <h1 class="gradient-text">Backprop by Hand</h1>
+    <p>Every forward kernel has a matching <code>*_backward</code></p>
+</section>
+
+<section>
+    <h3>Grads Mirror Params, Exactly</h3>
+    <div class="mirror-row">
+        <div class="mirror-col">
+            <h4>params_memory</h4>
+            <p>one buffer</p>
+            <p>16 tensors</p>
+            <p>the weights</p>
+        </div>
+        <div class="mirror-arrow">→</div>
+        <div class="mirror-col">
+            <h4>grads_memory</h4>
+            <p>same size</p>
+            <p>same layout</p>
+            <p>∂L/∂w</p>
+        </div>
+        <div class="mirror-arrow">→</div>
+        <div class="mirror-col">
+            <h4>m / v memory</h4>
+            <p>AdamW state</p>
+            <p>same size ×2</p>
+            <p>moments</p>
+        </div>
+    </div>
+    <div class="explain-box">
+        <p>There is no autograd graph. <code>grads_memory</code> is a second buffer with the <em>identical</em> layout to <code>params_memory</code> (and a <code>ParameterTensors grads</code> struct pointing into it). Because the layouts match byte-for-byte, the optimiser later updates every weight with one flat loop over the two buffers.</p>
+    </div>
+</section>
+
+<section>
+    <h3>layernorm_backward — The Chain Rule, Spelled Out</h3>
+    <pre><code class="language-c">void layernorm_backward(float* dinp, float* dweight, float* dbias,
+                        float* dout, float* inp, float* weight,
+                        float* mean, float* rstd, int B, int T, int C) {
+    for (int b = 0; b < B; b++)
+      for (int t = 0; t < T; t++) {
+        float* dout_bt = dout + b*T*C + t*C;
+        float* inp_bt  = inp  + b*T*C + t*C;
+        float* dinp_bt = dinp + b*T*C + t*C;
+        float mean_bt = mean[b*T+t], rstd_bt = rstd[b*T+t];
+        // two reduction terms needed by the normalisation gradient
+        float dnorm_mean = 0.0f, dnorm_norm_mean = 0.0f;
+        for (int i = 0; i < C; i++) {
+            float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+            float dnorm_i  = weight[i] * dout_bt[i];
+            dnorm_mean      += dnorm_i;
+            dnorm_norm_mean += dnorm_i * norm_bti;
+        }
+        dnorm_mean      /= C;
+        dnorm_norm_mean /= C;
+        for (int i = 0; i < C; i++) {
+            float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+            float dnorm_i  = weight[i] * dout_bt[i];
+            dbias[i]   += dout_bt[i];            // += : accumulate
+            dweight[i] += norm_bti * dout_bt[i]; //      over B,T
+            float dval = dnorm_i - dnorm_mean
+                         - norm_bti * dnorm_norm_mean;
+            dinp_bt[i] += dval * rstd_bt;
+        }
+    }
+}</code></pre>
+    <div class="explain-box small">
+        <p>Note <code>+=</code> everywhere: gradients <strong>accumulate</strong>. <code>dweight</code>/<code>dbias</code> sum contributions from every (b,t); the cached <code>mean</code>/<code>rstd</code> from the forward pass are reused rather than recomputed. This is hand-derived calculus — the price of having no autograd.</p>
+    </div>
+</section>
+
+<section>
+    <h3>matmul_backward — One Forward, Three Grads</h3>
+    <pre><code class="language-c">void matmul_backward(float* dinp, float* dweight, float* dbias,
+                     const float* dout, const float* inp,
+                     const float* weight, int B, int T, int C, int OC);
+//  dinp   += dout @ weight       (gradient flowing to the input)
+//  dweight += dout^T @ inp       (gradient of the weight matrix)
+//  dbias  += sum over B,T of dout</code></pre>
+    <div class="explain-box">
+        <p>A single matmul in the forward pass becomes three matmul-shaped reductions in the backward pass: one for the input, one for the weights, one for the bias. The same pattern repeats for QKV, the attention projection, both MLP layers and the classifier head.</p>
+    </div>
+    <div class="explain-box small">
+        <p><strong>The mirror principle:</strong> <code>encoder_backward</code>, <code>attention_backward</code>, <code>gelu_backward</code>, <code>residual_backward</code> and <code>crossentropy_softmax_backward</code> each undo their forward twin — the backward pass is literally the forward list, reversed.</p>
+    </div>
+</section>
+</section>
+
+<!-- ==================== PART 5: TRAINING STEP ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 5</h2>
+    <h1 class="gradient-text">The Training Step</h1>
+    <p>forward → zero_grad → backward → update</p>
+</section>
+
+<section>
+    <h3>Interactive: Walk the Kernel Sequence</h3>
+    <div class="kernel-stepper">
+        <div class="kernel-track" id="kernel-track"></div>
+        <div class="kernel-controls">
+            <button class="demo-btn" id="kernel-prev">◀ Prev</button>
+            <button class="demo-btn" id="kernel-play">Play ▶</button>
+            <button class="demo-btn" id="kernel-next">Next ▶</button>
+        </div>
+        <div class="kernel-desc" id="kernel-desc"></div>
+    </div>
+</section>
+
+<section>
+    <h3>gpt2_update — AdamW, By Hand</h3>
+    <pre><code class="language-c">void gpt2_update(GPT2 *model, float learning_rate, float beta1,
+                 float beta2, float eps, float weight_decay, int t) {
+    if (model->m_memory == NULL) { // lazily allocate moment buffers
+        model->m_memory = calloc(model->num_parameters, sizeof(float));
+        model->v_memory = calloc(model->num_parameters, sizeof(float));
+    }
+    for (size_t i = 0; i < model->num_parameters; i++) {
+        float param = model->params_memory[i];
+        float grad  = model->grads_memory[i];
+        // 1st & 2nd moment running averages
+        float m = beta1*model->m_memory[i] + (1.0f-beta1)*grad;
+        float v = beta2*model->v_memory[i] + (1.0f-beta2)*grad*grad;
+        // bias correction
+        float m_hat = m / (1.0f - powf(beta1, t));
+        float v_hat = v / (1.0f - powf(beta2, t));
+        model->m_memory[i] = m;
+        model->v_memory[i] = v;
+        // decoupled weight decay (the "W" in AdamW)
+        model->params_memory[i] -= learning_rate *
+            (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
+    }
+}</code></pre>
+    <div class="explain-box small">
+        <p>One flat loop over every parameter — possible only because params, grads, m and v all share the same layout. This is exactly what <code>torch.optim.AdamW</code> does, with nothing hidden.</p>
+    </div>
+</section>
+
+<section>
+    <h3>main() — The Training Loop</h3>
+    <pre><code class="language-c">// build the model from a PyTorch-exported checkpoint
+GPT2 model;
+gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+
+// dataloaders over tokenised .bin shards
+DataLoader train_loader, val_loader;
+dataloader_init(&train_loader, train_pattern, B, T, /*...*/);
+
+for (int step = 0; step <= 40; step++) {
+    dataloader_next_batch(&train_loader);          // inputs, targets
+    gpt2_forward(&model, train_loader.inputs,
+                 train_loader.targets, B, T);       // -> mean loss
+    gpt2_zero_grad(&model);                         // memset grads to 0
+    gpt2_backward(&model);                          // fill grads_memory
+    gpt2_update(&model, 1e-4f, 0.9f, 0.999f,
+                1e-8f, 0.0f, step+1);               // AdamW step
+    printf("step %d: train loss %f\n", step, model.mean_loss);
+}</code></pre>
+    <div class="explain-box small">
+        <p><strong>The four-line heart of training:</strong> <code>gpt2_forward</code> runs the kernel chain and computes the loss; <code>gpt2_zero_grad</code> memsets the grad buffer; <code>gpt2_backward</code> runs the reversed chain; <code>gpt2_update</code> steps AdamW. The dataloader just <code>fread</code>s <code>uint16</code> tokens from <code>.bin</code> shards.</p>
+    </div>
+</section>
+</section>
+
+<!-- ==================== PART 6: CUDA & SCALING ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 6</h2>
+    <h1 class="gradient-text">CUDA &amp; Scaling</h1>
+    <p>From a 1,000-line reference to faster-than-PyTorch</p>
+</section>
+
+<section>
+    <h3>Porting the Kernels to CUDA</h3>
+    <div class="two-col">
+        <div class="col">
+            <div class="explain-box small">
+                <p><strong>Same kernels, GPU threads.</strong> Each <code>*_forward</code>/<code>*_backward</code> becomes a CUDA kernel: the <code>(b,t)</code> / <code>(b,t,h)</code> loops map onto a grid of threads instead of an OpenMP loop.</p>
+                <p><strong>Mixed precision (BF16).</strong> The fast path stores activations/weights in bfloat16, with fp32 master state, for ~2× throughput and lower memory.</p>
+            </div>
+        </div>
+        <div class="col">
+            <div class="explain-box small">
+                <p><strong>cuBLASLt matmuls.</strong> The hand-written matmul is replaced by fused cuBLASLt GEMMs (matmul + bias + GELU epilogue).</p>
+                <p><strong>Flash attention.</strong> The attention kernel can use cuDNN's flash attention — never materialising the full T×T score matrix (off by default to keep compile times down).</p>
+            </div>
+        </div>
+    </div>
+    <pre><code class="language-bash"># cuDNN flash-attention build
+make train_gpt2cu USE_CUDNN=1
+./train_gpt2cu</code></pre>
+</section>
+
+<section>
+    <h3>Multi-GPU &amp; Multi-Node</h3>
+    <pre><code class="language-bash"># Data-parallel across N GPUs on one box (NCCL all-reduce of grads)
+mpirun -np 8 ./train_gpt2cu
+
+# Multi-node: same binary, launched across machines via MPI
+#  (also supports a shared filesystem or TCP sockets for init)</code></pre>
+    <div class="explain-box">
+        <p><strong>NCCL</strong> handles the gradient all-reduce between GPUs; <strong>MPI</strong> launches and coordinates processes across nodes. The single-buffer design pays off again: one flat <code>grads_memory</code> is exactly one all-reduce.</p>
+    </div>
+</section>
+
+<section>
+    <h3>Reproducing GPT-2 &amp; the Performance Story</h3>
+    <div class="comparison-table">
+        <table>
+            <thead>
+                <tr><th></th><th>CPU ref</th><th>fp32 CUDA</th><th>BF16 + cuDNN</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>Build</td><td><code>make train_gpt2</code></td><td><code>train_gpt2fp32cu</code></td><td><code>train_gpt2cu</code></td></tr>
+                <tr><td>Precision</td><td>fp32</td><td>fp32</td><td>BF16 (mixed)</td></tr>
+                <tr><td>Attention</td><td>naive</td><td>naive</td><td>flash (cuDNN)</td></tr>
+                <tr><td>Matmul</td><td>OpenMP loop</td><td>cuBLAS</td><td>cuBLASLt fused</td></tr>
+                <tr><td>Scaling</td><td>1 core/many</td><td>1 GPU</td><td>multi-GPU/node</td></tr>
+            </tbody>
+        </table>
+        <p class="table-note">The optimised CUDA build reportedly runs <strong>~7% faster than PyTorch nightly</strong> on the same GPT-2 (124M) training, while being a single dependency-free codebase you can read top to bottom. Reproducing GPT-2 124M is documented in the project's Discussion #481.</p>
+    </div>
+</section>
+
+<section>
+    <h3>Interactive: GPT-2 Memory Budget</h3>
+    <div class="budget-demo" id="budget-demo">
+        <label>Pick a GPT-2 size — see params, AdamW state (m+v) and activations:</label>
+        <div class="budget-sizes" id="budget-sizes">
+            <button class="budget-btn active" data-size="124M">124M</button>
+            <button class="budget-btn" data-size="350M">350M</button>
+            <button class="budget-btn" data-size="774M">774M</button>
+            <button class="budget-btn" data-size="1558M">1558M</button>
+        </div>
+        <div class="budget-bars" id="budget-bars"></div>
+        <p class="budget-note" id="budget-note"></p>
+    </div>
+</section>
+</section>
+
+<!-- ==================== SUMMARY ==================== -->
+<section>
+<section>
+    <h2 class="gradient-text">The Whole Thing, On One Slide</h2>
+    <div class="summary-grid">
+        <div class="summary-card">
+            <h4>Layout</h4>
+            <ul>
+                <li>GPT2Config = 6 ints</li>
+                <li>16 ParameterTensors</li>
+                <li>One malloc + offsets</li>
+                <li>Grads mirror params</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>Forward</h4>
+            <ul>
+                <li>encoder / layernorm</li>
+                <li>matmul / attention</li>
+                <li>gelu / residual</li>
+                <li>softmax + cross-entropy</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>Backward</h4>
+            <ul>
+                <li>One *_backward per kernel</li>
+                <li>Gradients accumulate (+=)</li>
+                <li>Cached mean/rstd reused</li>
+                <li>No autograd tape</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>Train &amp; Scale</h4>
+            <ul>
+                <li>Hand-rolled AdamW (m,v)</li>
+                <li>BF16, cuBLASLt, flash-attn</li>
+                <li>NCCL multi-GPU, MPI nodes</li>
+                <li>~7% faster than PyTorch</li>
+            </ul>
+        </div>
+    </div>
+</section>
+
+<section>
+    <h2>Where This Fits in Zero-to-Hero</h2>
+    <div class="z2h-track">
+        <div class="z2h-step"><strong>micrograd</strong><span>scalar autograd</span></div>
+        <div class="z2h-arrow">→</div>
+        <div class="z2h-step"><strong>makemore</strong><span>bigrams → MLP</span></div>
+        <div class="z2h-arrow">→</div>
+        <div class="z2h-step"><strong>nanoGPT</strong><span>GPT in PyTorch</span></div>
+        <div class="z2h-arrow">→</div>
+        <div class="z2h-step current"><strong>llm.c</strong><span>GPT in raw C/CUDA</span></div>
+    </div>
+    <div class="explain-box">
+        <p><strong>The arc:</strong> Zero-to-Hero builds intuition in Python — micrograd shows autograd from scratch, makemore and nanoGPT build a Transformer in PyTorch. <strong>llm.c</strong> is the natural next step: strip away PyTorch entirely and implement the <em>same</em> GPT-2 — forward, manual backward, and AdamW — close to the metal, then make it outrun the framework it replaced.</p>
+    </div>
+</section>
+
+<section>
+    <h2>Key Takeaways</h2>
+    <div class="takeaways">
+        <div class="takeaway">
+            <span class="takeaway-num">1</span>
+            <p><strong>A whole LLM trainer fits in ~1,000 lines of C.</strong> One config struct, one parameter buffer, a handful of kernels, their hand-written backward twins, and AdamW — no PyTorch, no Python, no autograd engine.</p>
+        </div>
+        <div class="takeaway">
+            <span class="takeaway-num">2</span>
+            <p><strong>Frameworks aren't magic.</strong> Reading <code>matmul_backward</code> or <code>gpt2_update</code> shows exactly what <code>loss.backward()</code> and <code>optimizer.step()</code> do — the maths is all there, written out by hand.</p>
+        </div>
+        <div class="takeaway">
+            <span class="takeaway-num">3</span>
+            <p><strong>Simple can also be fast.</strong> The same design, ported to CUDA with BF16, cuBLASLt and flash-attention, reproduces GPT-2 and runs ~7% faster than PyTorch — scaling to multi-GPU (NCCL) and multi-node (MPI).</p>
+        </div>
+    </div>
+    <div class="credits">
+        <p>Based on Andrej Karpathy's <a href="https://github.com/karpathy/llm.c" target="_blank">llm.c</a></p>
+        <p>Code &amp; docs: <a href="https://github.com/karpathy/llm.c" target="_blank">github.com/karpathy/llm.c</a></p>
+    </div>
+</section>
+</section>
+
+</div><!-- /slides -->
+</div><!-- /reveal -->
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/reveal.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/plugin/highlight/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="interactive.js"></script>
+<script>
+Reveal.initialize({
+    hash: true,
+    slideNumber: true,
+    transition: 'slide',
+    backgroundTransition: 'fade',
+    plugins: [ RevealHighlight ],
+    width: 1200,
+    height: 700,
+    margin: 0.04,
+});
+</script>
+</body>
+</html>
