@@ -8,6 +8,7 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/theme/black.min.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/monokai.min.css">
     <link rel="stylesheet" href="style.css">
+<style>:root{--r-background-color:#1f1622}.reveal-viewport{background:#1f1622}</style>
 </head>
 <body>
 <div class="reveal">
@@ -638,7 +639,7 @@ mpirun -np 8 ./train_gpt2cu
                 <tr><td>Scaling</td><td>1 core/many</td><td>1 GPU</td><td>multi-GPU/node</td></tr>
             </tbody>
         </table>
-        <p class="table-note">The optimised CUDA build reportedly runs <strong>~7% faster than PyTorch nightly</strong> on the same GPT-2 (124M) training, while being a single dependency-free codebase you can read top to bottom. Reproducing GPT-2 124M is documented in the project's Discussion #481.</p>
+        <p class="table-note">The optimised CUDA build reportedly runs <strong>~7% faster than PyTorch nightly</strong> on the same GPT-2 (124M) training, while being a single dependency-free codebase you can read top to bottom. Reproducing GPT-2 124M is documented in the project's Discussion #5e764e.</p>
     </div>
 </section>
 
